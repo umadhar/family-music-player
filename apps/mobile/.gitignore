@@ -1,0 +1,10 @@
+# Flutter build outputs
+build/
+
+# Dart tooling
+.dart_tool/
+.packages
+.pub/
+
+# Android local properties
+android/local.properties

@@ -1,0 +1,36 @@
+# Flutter / Dart
+**/build/
+.dart_tool/
+.packages
+.pub/
+
+# IDEs
+.idea/
+.vscode/
+*.iml
+
+# macOS / Windows / Linux
+.DS_Store
+Thumbs.db
+
+# Generated app data
+apps/mobile/android/local.properties
+apps/mobile/.flutter-plugins
+apps/mobile/.flutter-plugins-dependencies
+apps/mobile/.metadata
+
+# Local environment files
+.env
+.env.*
+!.env.example
+
+# Android signing / APK output
+*.jks
+*.keystore
+*.p12
+*.pfx
+*.apk
+*.aab
+
+# Archive / backups
+*.log
