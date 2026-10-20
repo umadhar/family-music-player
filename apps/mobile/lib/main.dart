@@ -1,12 +1,17 @@
+import 'dart:async';
 import 'dart:io';
 
+import 'package:audio_service/audio_service.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:just_audio/just_audio.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import 'package:provider/provider.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
+
+import 'music_audio_handler.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -16,16 +21,32 @@ Future<void> main() async {
     databaseFactory = databaseFactoryFfi;
   }
 
-  runApp(const KidsMusicPlayerApp());
+  final audioHandler = Platform.isAndroid
+      ? await AudioService.init<MusicAudioHandler>(
+          builder: () => MusicAudioHandler(AudioPlayer()),
+          config: const AudioServiceConfig(
+            androidNotificationChannelId: 'com.example.kids_music_player.audio',
+            androidNotificationChannelName: 'Tiny Tunes playback',
+            androidNotificationChannelDescription:
+                'Playback controls for your local music library.',
+            androidNotificationOngoing: true,
+            androidStopForegroundOnPause: true,
+          ),
+        )
+      : MusicAudioHandler(AudioPlayer());
+
+  runApp(KidsMusicPlayerApp(audioHandler: audioHandler));
 }
 
 class KidsMusicPlayerApp extends StatelessWidget {
-  const KidsMusicPlayerApp({super.key});
+  const KidsMusicPlayerApp({required this.audioHandler, super.key});
+
+  final MusicAudioHandler audioHandler;
 
   @override
   Widget build(BuildContext context) {
     return ChangeNotifierProvider(
-      create: (_) => MusicPlayerModel()..initialize(),
+      create: (_) => MusicPlayerModel(audioHandler: audioHandler)..initialize(),
       child: MaterialApp(
         title: 'Tiny Tunes',
         debugShowCheckedModeBanner: false,
@@ -92,6 +113,27 @@ class Song {
   }
 }
 
+MediaItem createMediaItemForSong(Song song) {
+  final fileTitle = p
+      .basenameWithoutExtension(song.filePath)
+      .replaceAll('_', ' ')
+      .trim();
+  final title = song.title.trim();
+  final notificationTitle = title.isEmpty || title == 'Untitled track'
+      ? fileTitle
+      : title;
+
+  return MediaItem(
+    id: song.id.toString(),
+    title: notificationTitle.isEmpty ? 'Untitled track' : notificationTitle,
+    artist: song.artist.trim().isEmpty ? 'Local track' : song.artist.trim(),
+    duration: song.durationMs > 0
+        ? Duration(milliseconds: song.durationMs)
+        : null,
+    extras: {'filePath': song.filePath},
+  );
+}
+
 class Playlist {
   const Playlist({required this.id, required this.name});
 
@@ -104,6 +146,8 @@ class Playlist {
 }
 
 class MusicLibraryRepository {
+  MusicLibraryRepository({Database? database}) : _database = database;
+
   Database? _database;
 
   Future<Database> get database async {
@@ -123,34 +167,36 @@ class MusicLibraryRepository {
     return openDatabase(
       path,
       version: 1,
-      onCreate: (db, version) async {
-        await db.execute('''
-          CREATE TABLE songs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            title TEXT NOT NULL,
-            artist TEXT NOT NULL,
-            file_path TEXT NOT NULL UNIQUE,
-            duration_ms INTEGER NOT NULL DEFAULT 0,
-            favorite INTEGER NOT NULL DEFAULT 0
-          )
-        ''');
-
-        await db.execute('''
-          CREATE TABLE playlists (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL UNIQUE
-          )
-        ''');
-
-        await db.execute('''
-          CREATE TABLE playlist_songs (
-            playlist_id INTEGER NOT NULL,
-            song_id INTEGER NOT NULL,
-            PRIMARY KEY (playlist_id, song_id)
-          )
-        ''');
-      },
+      onCreate: (db, version) => _createTables(db),
     );
+  }
+
+  Future<void> _createTables(DatabaseExecutor db) async {
+    await db.execute('''
+      CREATE TABLE songs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        title TEXT NOT NULL,
+        artist TEXT NOT NULL,
+        file_path TEXT NOT NULL UNIQUE,
+        duration_ms INTEGER NOT NULL DEFAULT 0,
+        favorite INTEGER NOT NULL DEFAULT 0
+      )
+    ''');
+
+    await db.execute('''
+      CREATE TABLE playlists (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL UNIQUE
+      )
+    ''');
+
+    await db.execute('''
+      CREATE TABLE playlist_songs (
+        playlist_id INTEGER NOT NULL,
+        song_id INTEGER NOT NULL,
+        PRIMARY KEY (playlist_id, song_id)
+      )
+    ''');
   }
 
   Future<void> initialize() async {
@@ -223,8 +269,9 @@ class MusicLibraryRepository {
 
     final destinationFile = await sourceFile.copy(destinationPath);
     final title = p
-        .basenameWithoutExtension(destinationFile.path)
-        .replaceAll('_', ' ');
+        .basenameWithoutExtension(originalName)
+        .replaceAll(RegExp(r'[_-]+'), ' ')
+        .trim();
     final song = Song(
       id: 0,
       title: title.isEmpty ? 'Untitled track' : title,
@@ -303,6 +350,25 @@ class MusicLibraryRepository {
     );
   }
 
+  Future<void> removeSong(int songId) async {
+    final db = await database;
+    await db.transaction((transaction) async {
+      final deleted = await transaction.delete(
+        'songs',
+        where: 'id = ?',
+        whereArgs: [songId],
+      );
+      if (deleted == 0) {
+        throw StateError('This song is no longer in your library.');
+      }
+      await transaction.delete(
+        'playlist_songs',
+        where: 'song_id = ?',
+        whereArgs: [songId],
+      );
+    });
+  }
+
   Future<void> toggleFavorite(int songId) async {
     final db = await database;
     final rows = await db.query('songs', where: 'id = ?', whereArgs: [songId]);
@@ -343,28 +409,23 @@ class MusicLibraryRepository {
 }
 
 class MusicPlayerModel extends ChangeNotifier {
-  MusicPlayerModel()
-    : _repository = MusicLibraryRepository(),
-      _player = AudioPlayer();
+  MusicPlayerModel({
+    required this.audioHandler,
+    MusicLibraryRepository? repository,
+  }) : _repository = repository ?? MusicLibraryRepository();
 
+  final MusicAudioHandler audioHandler;
   final MusicLibraryRepository _repository;
-  final AudioPlayer _player;
 
   final List<Song> _songs = [];
   final List<Playlist> _playlists = [];
-  final List<Song> _queue = [];
+  final List<StreamSubscription<dynamic>> _subscriptions = [];
   String _searchTerm = '';
-  Song? _currentSong;
-  int _currentQueueIndex = -1;
   bool _isReady = false;
-  bool _isPlaying = false;
-  bool _shuffleEnabled = false;
-  bool _repeatEnabled = false;
-  Duration _position = Duration.zero;
-  Duration? _duration;
   String? _statusMessage;
 
   bool get isReady => _isReady;
+  String get searchTerm => _searchTerm;
   List<Song> get songs => List.unmodifiable(_songs);
   List<Playlist> get playlists => List.unmodifiable(_playlists);
   List<Song> get favorites => _songs.where((song) => song.isFavorite).toList();
@@ -381,57 +442,76 @@ class MusicPlayerModel extends ChangeNotifier {
         .toList();
   }
 
-  Song? get currentSong => _currentSong;
-  bool get isPlaying => _isPlaying;
-  bool get shuffleEnabled => _shuffleEnabled;
-  bool get repeatEnabled => _repeatEnabled;
-  Duration get position => _position;
-  Duration? get duration => _duration;
+  Song? get currentSong {
+    final item = audioHandler.currentMediaItem;
+    if (item == null) return null;
+    final id = int.tryParse(item.id);
+    if (id == null) return null;
+    for (final song in _songs) {
+      if (song.id == id) return song;
+    }
+    return null;
+  }
+
+  bool get isPlaying => audioHandler.playbackState.value.playing;
+  bool get shuffleEnabled => audioHandler.shuffleEnabled;
+  bool get repeatEnabled => audioHandler.repeatEnabled;
+  Duration get position => audioHandler.position;
+  Duration? get duration => audioHandler.duration;
   String? get statusMessage => _statusMessage;
 
   Future<void> initialize() async {
     await _repository.initialize();
     await refresh();
 
-    _player.playerStateStream.listen((state) {
-      final isPlaying = state.playing;
-      if (_isPlaying != isPlaying) {
-        _isPlaying = isPlaying;
+    _subscriptions.add(
+      audioHandler.playbackState.listen((state) {
+        if (state.processingState == AudioProcessingState.error) {
+          _statusMessage =
+              'Playback error: ${state.errorMessage ?? 'Unknown error'}';
+        }
         notifyListeners();
-      }
-    });
-
-    _player.positionStream.listen((value) {
-      _position = value;
-      notifyListeners();
-    });
-
-    _player.durationStream.listen((value) {
-      _duration = value;
-      if (value != null && _currentSong != null) {
-        final durationMs = value.inMilliseconds;
-        if (durationMs > 0) {
-          _repository.updateDuration(_currentSong!.id, durationMs);
-          final index = _songs.indexWhere(
-            (element) => element.id == _currentSong!.id,
-          );
-          if (index >= 0) {
-            _songs[index] = Song(
-              id: _songs[index].id,
-              title: _songs[index].title,
-              artist: _songs[index].artist,
-              filePath: _songs[index].filePath,
-              durationMs: durationMs,
-              isFavorite: _songs[index].isFavorite,
-            );
+      }),
+    );
+    _subscriptions.add(audioHandler.mediaItem.listen((_) => notifyListeners()));
+    _subscriptions.add(
+      audioHandler.positionStream.listen((_) => notifyListeners()),
+    );
+    _subscriptions.add(
+      audioHandler.durationStream.listen((value) {
+        if (value != null && value.inMilliseconds > 0) {
+          final song = currentSong;
+          if (song != null && song.durationMs != value.inMilliseconds) {
+            _persistDuration(song, value.inMilliseconds);
           }
         }
-      }
-      notifyListeners();
-    });
+        notifyListeners();
+      }),
+    );
 
     _isReady = true;
     notifyListeners();
+  }
+
+  Future<void> _persistDuration(Song song, int durationMs) async {
+    try {
+      await _repository.updateDuration(song.id, durationMs);
+      final index = _songs.indexWhere((entry) => entry.id == song.id);
+      if (index >= 0) {
+        _songs[index] = Song(
+          id: song.id,
+          title: song.title,
+          artist: song.artist,
+          filePath: song.filePath,
+          durationMs: durationMs,
+          isFavorite: song.isFavorite,
+        );
+      }
+      notifyListeners();
+    } on DatabaseException catch (error) {
+      _statusMessage = 'Unable to save track duration: $error';
+      notifyListeners();
+    }
   }
 
   Future<void> refresh() async {
@@ -483,32 +563,74 @@ class MusicPlayerModel extends ChangeNotifier {
   Future<void> playQueue(List<Song> songs, {int startIndex = 0}) async {
     if (songs.isEmpty) return;
 
-    final safeIndex = startIndex.clamp(0, songs.length - 1);
-    _queue
-      ..clear()
-      ..addAll(songs);
-    _currentQueueIndex = safeIndex;
-    _currentSong = songs[safeIndex];
+    final safeRequestedIndex = startIndex.clamp(0, songs.length - 1);
+    final playableSongs = <Song>[];
+    var missingCount = 0;
+    for (final song in songs) {
+      try {
+        if (song.filePath.isNotEmpty && await File(song.filePath).exists()) {
+          playableSongs.add(song);
+        } else {
+          missingCount++;
+        }
+      } on FileSystemException {
+        missingCount++;
+      }
+    }
 
-    final audioSources = songs
-        .map((song) => AudioSource.uri(Uri.file(song.filePath)))
-        .toList(growable: false);
-
-    try {
-      await _player.setAudioSources(
-        audioSources,
-        initialIndex: safeIndex,
-        preload: false,
-      );
-      await _player.play();
-      _isPlaying = true;
-      _statusMessage = 'Now playing ${_currentSong!.title}';
+    if (playableSongs.isEmpty) {
+      await audioHandler.setQueue([]);
+      _statusMessage = 'No playable audio files were found in this queue.';
       notifyListeners();
-    } catch (_) {
-      _statusMessage =
-          'Unable to play ${_currentSong!.title}. The file may be missing.';
+      return;
+    }
+
+    final requestedSongId = songs[safeRequestedIndex].id;
+    var playableStartIndex = playableSongs.indexWhere(
+      (song) => song.id == requestedSongId,
+    );
+    if (playableStartIndex < 0) {
+      playableStartIndex = playableSongs.indexWhere(
+        (song) =>
+            songs.indexWhere((requestedSong) => requestedSong.id == song.id) >
+            safeRequestedIndex,
+      );
+      if (playableStartIndex < 0) playableStartIndex = 0;
+    }
+
+    final items = playableSongs
+        .map(createMediaItemForSong)
+        .toList(growable: false);
+    final started = await _runPlaybackAction(() async {
+      await audioHandler.setQueue(
+        items,
+        startIndex: playableStartIndex,
+        shuffleEnabled: shuffleEnabled,
+        repeatEnabled: repeatEnabled,
+      );
+      await audioHandler.play();
+    });
+    if (started) {
+      _statusMessage = missingCount > 0
+          ? 'Some missing tracks were skipped. Now playing ${playableSongs[playableStartIndex].title}.'
+          : 'Now playing ${playableSongs[playableStartIndex].title}';
       notifyListeners();
     }
+  }
+
+  Future<bool> _runPlaybackAction(Future<void> Function() action) async {
+    try {
+      await action();
+      return true;
+    } on PlayerException catch (error) {
+      _statusMessage = 'Unable to play this track: ${error.message}';
+    } on PlayerInterruptedException catch (error) {
+      _statusMessage = 'Playback was interrupted: ${error.message}';
+    } on PlatformException catch (error) {
+      _statusMessage = 'Playback error: ${error.message ?? error.code}';
+    }
+    notifyListeners();
+    return false;
   }
 
   Future<void> playSong(Song song) async {
@@ -518,66 +640,31 @@ class MusicPlayerModel extends ChangeNotifier {
   }
 
   Future<void> togglePlayPause() async {
-    if (_currentSong == null) {
+    if (currentSong == null) {
       if (_songs.isNotEmpty) {
         await playQueue(_songs, startIndex: 0);
       }
       return;
     }
 
-    if (_isPlaying) {
-      await _player.pause();
-    } else {
-      await _player.play();
-    }
+    await _runPlaybackAction(
+      isPlaying ? audioHandler.pause : audioHandler.play,
+    );
     notifyListeners();
   }
 
   Future<void> nextTrack() async {
-    if (_queue.isEmpty) {
-      if (_songs.isNotEmpty) {
-        await playQueue(_songs, startIndex: 0);
-      }
+    if (audioHandler.queue.value.isEmpty) {
+      if (_songs.isNotEmpty) await playQueue(_songs, startIndex: 0);
       return;
     }
-
-    int nextIndex = _currentQueueIndex + 1;
-    if (_shuffleEnabled) {
-      nextIndex = _randomIndex();
-    } else if (nextIndex >= _queue.length) {
-      if (_repeatEnabled) {
-        nextIndex = 0;
-      } else {
-        nextIndex = _queue.length - 1;
-      }
-    }
-
-    _currentQueueIndex = nextIndex;
-    _currentSong = _queue[nextIndex];
-    await _player.seek(Duration.zero, index: nextIndex);
-    await _player.play();
+    await _runPlaybackAction(audioHandler.skipToNext);
     notifyListeners();
   }
 
   Future<void> previousTrack() async {
-    if (_queue.isEmpty) return;
-
-    var previousIndex = _currentQueueIndex - 1;
-    if (previousIndex < 0) {
-      previousIndex = _repeatEnabled ? _queue.length - 1 : 0;
-    }
-
-    _currentQueueIndex = previousIndex;
-    _currentSong = _queue[previousIndex];
-    await _player.seek(Duration.zero, index: previousIndex);
-    await _player.play();
+    await _runPlaybackAction(audioHandler.skipToPrevious);
     notifyListeners();
-  }
-
-  int _randomIndex() {
-    if (_queue.length < 2) return 0;
-    final random = DateTime.now().millisecondsSinceEpoch % _queue.length;
-    return random;
   }
 
   Future<void> toggleFavorite(Song song) async {
@@ -593,15 +680,29 @@ class MusicPlayerModel extends ChangeNotifier {
         isFavorite: !song.isFavorite,
       );
       _songs[index] = updatedSong;
-      if (_currentSong != null && _currentSong!.id == song.id) {
-        _currentSong = updatedSong;
-      }
     }
     notifyListeners();
   }
 
+  Future<void> removeSong(Song song) async {
+    await _repository.removeSong(song.id);
+    _songs.removeWhere((entry) => entry.id == song.id);
+    notifyListeners();
+    try {
+      await audioHandler.removeFromQueue(song.id.toString());
+    } catch (error) {
+      _statusMessage =
+          'Song removed from the library, but playback could not be updated: $error';
+      notifyListeners();
+      rethrow;
+    }
+
+    _statusMessage = '${song.title} was removed from your library.';
+    await refresh();
+  }
+
   Future<void> seekTo(Duration value) async {
-    await _player.seek(value);
+    await _runPlaybackAction(() => audioHandler.seek(value));
     notifyListeners();
   }
 
@@ -631,12 +732,18 @@ class MusicPlayerModel extends ChangeNotifier {
   }
 
   Future<void> toggleShuffle() async {
-    _shuffleEnabled = !_shuffleEnabled;
+    await audioHandler.setShuffleMode(
+      shuffleEnabled
+          ? AudioServiceShuffleMode.none
+          : AudioServiceShuffleMode.all,
+    );
     notifyListeners();
   }
 
   Future<void> toggleRepeat() async {
-    _repeatEnabled = !_repeatEnabled;
+    await audioHandler.setRepeatMode(
+      repeatEnabled ? AudioServiceRepeatMode.none : AudioServiceRepeatMode.all,
+    );
     notifyListeners();
   }
 
@@ -644,8 +751,12 @@ class MusicPlayerModel extends ChangeNotifier {
     return _repository.getSongsForPlaylist(playlist.id);
   }
 
-  Future<void> disposePlayer() async {
-    await _player.dispose();
+  @override
+  void dispose() {
+    for (final subscription in _subscriptions) {
+      unawaited(subscription.cancel());
+    }
+    super.dispose();
   }
 }
 
@@ -905,7 +1016,7 @@ class LibraryTab extends StatelessWidget {
     return Column(
       children: [
         Padding(
-          padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
+          padding: const EdgeInsets.fromLTRB(16, 14, 16, 8),
           child: TextField(
             onChanged: model.setSearchTerm,
             decoration: InputDecoration(
@@ -913,66 +1024,54 @@ class LibraryTab extends StatelessWidget {
               prefixIcon: const Icon(Icons.search),
               filled: true,
               fillColor: Colors.white,
+              contentPadding: const EdgeInsets.symmetric(vertical: 14),
               border: OutlineInputBorder(
                 borderRadius: BorderRadius.circular(16),
+                borderSide: BorderSide.none,
+              ),
+              enabledBorder: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(16),
+                borderSide: BorderSide.none,
               ),
             ),
           ),
         ),
         if (model.statusMessage != null)
           Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 16),
+            padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
             child: Text(
               model.statusMessage!,
-              style: const TextStyle(color: Colors.green),
+              style: TextStyle(
+                color: Theme.of(context).colorScheme.primary,
+                fontSize: 12,
+              ),
             ),
           ),
         Expanded(
           child: songs.isEmpty
-              ? const Center(
-                  child: Padding(
-                    padding: EdgeInsets.all(16),
-                    child: Text(
-                      'No songs match your search yet. Try importing a few tracks.',
-                    ),
-                  ),
+              ? _LibraryEmptyState(
+                  hasSearch: model.searchTerm.trim().isNotEmpty,
+                  onClearSearch: () => model.setSearchTerm(''),
+                  onImport: model.importFiles,
                 )
               : ListView.separated(
-                  padding: const EdgeInsets.all(16),
+                  padding: const EdgeInsets.fromLTRB(16, 8, 16, 20),
                   itemCount: songs.length,
                   separatorBuilder: (context, index) =>
-                      const SizedBox(height: 8),
+                      const SizedBox(height: 10),
                   itemBuilder: (context, index) {
                     final song = songs[index];
-                    return Card(
-                      child: ListTile(
-                        leading: CircleAvatar(
-                          backgroundColor: Colors.deepPurple.shade100,
-                          child: Text(song.leadingLetter),
-                        ),
-                        title: Text(song.title),
-                        subtitle: Text(
-                          '${song.artist} • ${song.durationLabel}',
-                        ),
-                        trailing: Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            IconButton(
-                              onPressed: () => model.toggleFavorite(song),
-                              icon: Icon(
-                                song.isFavorite
-                                    ? Icons.favorite
-                                    : Icons.favorite_border,
-                                color: Colors.pink,
-                              ),
-                            ),
-                            IconButton(
-                              onPressed: () => model.playSong(song),
-                              icon: const Icon(Icons.play_circle_outline),
-                            ),
-                          ],
-                        ),
-                        onTap: () => model.playSong(song),
+                    return _LibrarySongTile(
+                      song: song,
+                      isCurrent: model.currentSong?.id == song.id,
+                      isPlaying: model.isPlaying,
+                      onPlay: () => model.playSong(song),
+                      onTogglePlayback: model.togglePlayPause,
+                      onAction: (action) => _handleLibrarySongAction(
+                        context,
+                        model,
+                        song,
+                        action,
                       ),
                     );
                   },
@@ -981,6 +1080,332 @@ class LibraryTab extends StatelessWidget {
       ],
     );
   }
+}
+
+class _LibrarySongTile extends StatelessWidget {
+  const _LibrarySongTile({
+    required this.song,
+    required this.isCurrent,
+    required this.isPlaying,
+    required this.onPlay,
+    required this.onTogglePlayback,
+    required this.onAction,
+  });
+
+  final Song song;
+  final bool isCurrent;
+  final bool isPlaying;
+  final VoidCallback onPlay;
+  final VoidCallback onTogglePlayback;
+  final ValueChanged<String> onAction;
+
+  @override
+  Widget build(BuildContext context) {
+    final metadata = <String>[
+      if (song.artist.trim().isNotEmpty && song.artist != 'Local track')
+        song.artist.trim(),
+      if (song.durationMs > 0) song.durationLabel,
+      if (isCurrent) isPlaying ? 'Now playing' : 'Paused',
+    ];
+
+    return Card(
+      margin: EdgeInsets.zero,
+      color: isCurrent
+          ? Theme.of(
+              context,
+            ).colorScheme.primaryContainer.withValues(alpha: 0.7)
+          : Colors.white,
+      elevation: 1,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(20),
+        side: BorderSide(
+          color: isCurrent
+              ? Theme.of(context).colorScheme.primary.withValues(alpha: 0.35)
+              : Colors.transparent,
+        ),
+      ),
+      clipBehavior: Clip.antiAlias,
+      child: ListTile(
+        minTileHeight: 82,
+        contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+        leading: _SongArtwork(song: song, isCurrent: isCurrent),
+        title: Text(
+          _songDisplayTitle(song),
+          maxLines: 2,
+          overflow: TextOverflow.ellipsis,
+          style: TextStyle(
+            fontWeight: isCurrent ? FontWeight.w700 : FontWeight.w600,
+            fontSize: 15,
+          ),
+        ),
+        subtitle: metadata.isEmpty
+            ? null
+            : Text(
+                metadata.join('  •  '),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  color: isCurrent
+                      ? Theme.of(context).colorScheme.primary
+                      : Theme.of(context).colorScheme.onSurfaceVariant,
+                  fontSize: 12,
+                ),
+              ),
+        trailing: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            IconButton.filledTonal(
+              tooltip: isCurrent && isPlaying ? 'Pause' : 'Play',
+              visualDensity: VisualDensity.compact,
+              onPressed: isCurrent && isPlaying ? onTogglePlayback : onPlay,
+              icon: Icon(
+                isCurrent && isPlaying
+                    ? Icons.pause_rounded
+                    : Icons.play_arrow_rounded,
+              ),
+            ),
+            PopupMenuButton<String>(
+              tooltip: 'More song options',
+              onSelected: onAction,
+              itemBuilder: (context) => [
+                PopupMenuItem(
+                  value: 'favorite',
+                  child: Text(
+                    song.isFavorite
+                        ? 'Remove from favorites'
+                        : 'Add to favorites',
+                  ),
+                ),
+                const PopupMenuItem(
+                  value: 'playlist',
+                  child: Text('Add to playlist'),
+                ),
+                const PopupMenuItem(
+                  value: 'remove',
+                  child: Text('Remove from library'),
+                ),
+              ],
+            ),
+          ],
+        ),
+        onTap: isCurrent && isPlaying ? onTogglePlayback : onPlay,
+      ),
+    );
+  }
+}
+
+class _SongArtwork extends StatelessWidget {
+  const _SongArtwork({required this.song, required this.isCurrent});
+
+  final Song song;
+  final bool isCurrent;
+
+  @override
+  Widget build(BuildContext context) {
+    const colors = [
+      Color(0xFFFFD6A5),
+      Color(0xFFCAFFBF),
+      Color(0xFFA0C4FF),
+      Color(0xFFFFADAD),
+      Color(0xFFE4C1F9),
+    ];
+    final color = colors[song.id.abs() % colors.length];
+
+    return Container(
+      width: 54,
+      height: 54,
+      decoration: BoxDecoration(
+        color: color,
+        borderRadius: BorderRadius.circular(16),
+      ),
+      child: Icon(
+        isCurrent ? Icons.graphic_eq_rounded : Icons.music_note_rounded,
+        color: const Color(0xFF4D3E68),
+        size: 27,
+      ),
+    );
+  }
+}
+
+class _LibraryEmptyState extends StatelessWidget {
+  const _LibraryEmptyState({
+    required this.hasSearch,
+    required this.onClearSearch,
+    required this.onImport,
+  });
+
+  final bool hasSearch;
+  final VoidCallback onClearSearch;
+  final VoidCallback onImport;
+
+  @override
+  Widget build(BuildContext context) {
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(28),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Container(
+              width: 88,
+              height: 88,
+              decoration: BoxDecoration(
+                color: const Color(0xFFE8DEFF),
+                borderRadius: BorderRadius.circular(28),
+              ),
+              child: Icon(
+                hasSearch
+                    ? Icons.search_off_rounded
+                    : Icons.library_music_rounded,
+                size: 42,
+                color: const Color(0xFF7255B5),
+              ),
+            ),
+            const SizedBox(height: 18),
+            Text(
+              hasSearch ? 'No tunes found' : 'Your song shelf is waiting!',
+              textAlign: TextAlign.center,
+              style: Theme.of(
+                context,
+              ).textTheme.titleLarge?.copyWith(fontWeight: FontWeight.w700),
+            ),
+            const SizedBox(height: 8),
+            Text(
+              hasSearch
+                  ? 'Try a different song or artist name.'
+                  : 'Add some of your favorite music to get started.',
+              textAlign: TextAlign.center,
+              style: Theme.of(context).textTheme.bodyMedium,
+            ),
+            const SizedBox(height: 18),
+            FilledButton.icon(
+              onPressed: hasSearch ? onClearSearch : onImport,
+              icon: Icon(hasSearch ? Icons.clear_rounded : Icons.add_rounded),
+              label: Text(hasSearch ? 'Clear search' : 'Import songs'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+Future<void> _handleLibrarySongAction(
+  BuildContext context,
+  MusicPlayerModel model,
+  Song song,
+  String action,
+) async {
+  if (action == 'favorite') {
+    try {
+      await model.toggleFavorite(song);
+    } catch (error) {
+      if (context.mounted) {
+        _showLibraryMessage(context, 'Unable to update favorite: $error');
+      }
+    }
+    return;
+  }
+
+  if (action == 'playlist') {
+    final playlists = model.playlists
+        .where((playlist) => playlist.name != 'Favorites')
+        .toList();
+    final selected = await showDialog<Playlist>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Add to playlist'),
+        content: playlists.isEmpty
+            ? const Text(
+                'Create a playlist first to keep this song in a collection.',
+              )
+            : SizedBox(
+                width: double.maxFinite,
+                height: 280,
+                child: ListView(
+                  shrinkWrap: true,
+                  children: playlists
+                      .map(
+                        (playlist) => ListTile(
+                          leading: const Icon(Icons.queue_music_rounded),
+                          title: Text(
+                            playlist.name,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                          onTap: () => Navigator.pop(dialogContext, playlist),
+                        ),
+                      )
+                      .toList(),
+                ),
+              ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext),
+            child: const Text('Close'),
+          ),
+        ],
+      ),
+    );
+    if (selected != null) {
+      try {
+        await model.addSongToPlaylist(song, selected);
+      } catch (error) {
+        if (context.mounted) {
+          _showLibraryMessage(
+            context,
+            'Unable to add song to playlist: $error',
+          );
+        }
+      }
+    }
+    return;
+  }
+
+  final confirmed = await showDialog<bool>(
+    context: context,
+    builder: (dialogContext) => AlertDialog(
+      title: const Text('Remove song from library?'),
+      content: Text(
+        '“${_songDisplayTitle(song)}” will be removed from your Tiny Tunes library and playlists. The audio file will not be deleted.',
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(dialogContext, false),
+          child: const Text('Cancel'),
+        ),
+        FilledButton(
+          onPressed: () => Navigator.pop(dialogContext, true),
+          child: const Text('Remove song'),
+        ),
+      ],
+    ),
+  );
+  if (confirmed != true) return;
+
+  try {
+    await model.removeSong(song);
+  } catch (error) {
+    if (context.mounted) {
+      _showLibraryMessage(context, 'Unable to remove song: $error');
+    }
+  }
+}
+
+String _songDisplayTitle(Song song) {
+  final title = song.title.trim();
+  if (title.isNotEmpty && title != 'Untitled track') return title;
+  final filename = p
+      .basenameWithoutExtension(song.filePath)
+      .replaceAll(RegExp(r'[_-]+'), ' ')
+      .trim();
+  return filename.isEmpty ? 'Untitled track' : filename;
+}
+
+void _showLibraryMessage(BuildContext context, String message) {
+  ScaffoldMessenger.of(context)
+    ..hideCurrentSnackBar()
+    ..showSnackBar(SnackBar(content: Text(message)));
 }
 
 class PlaylistTab extends StatelessWidget {
